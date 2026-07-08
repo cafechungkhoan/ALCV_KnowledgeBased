@@ -1,0 +1,37 @@
+name: Deploy RuView dashboard to Firebase Hosting
+
+# Tự deploy thư mục ruview-demo/ lên Firebase Hosting.
+# CẦN thêm 2 secret trong repo (Settings → Secrets and variables → Actions):
+#   FIREBASE_TOKEN       — chạy `firebase login:ci` trên máy bạn để lấy
+#   FIREBASE_PROJECT_ID  — Project ID Firebase của bạn (chữ thường)
+# Sau đó vào tab Actions → chạy workflow này (Run workflow), hoặc bỏ comment
+# phần "push" bên dưới để tự deploy mỗi lần push.
+
+on:
+  workflow_dispatch:
+  # push:
+  #   branches: [ claude/csi-ruview-library-vfzfwn ]
+  #   paths: [ 'ruview-demo/**', 'firebase.json', '.firebaserc' ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install Firebase CLI
+        run: npm install -g firebase-tools
+      - name: Deploy to Firebase Hosting
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+        run: |
+          if [ -z "$FIREBASE_TOKEN" ] || [ -z "${{ secrets.FIREBASE_PROJECT_ID }}" ]; then
+            echo "::error::Thiếu secret FIREBASE_TOKEN hoặc FIREBASE_PROJECT_ID. Xem ruview-demo/FIREBASE_DEPLOY.md"
+            exit 1
+          fi
+          firebase deploy --only hosting \
+            --project "${{ secrets.FIREBASE_PROJECT_ID }}" \
+            --token "$FIREBASE_TOKEN" \
+            --non-interactive
