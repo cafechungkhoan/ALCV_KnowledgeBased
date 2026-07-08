@@ -157,6 +157,65 @@ Các class/API chính có sẵn: `BreathingExtractor`, `HeartRateExtractor`, `Po
 
 ---
 
+## 8. Build từ source — quy trình ĐÃ KIỂM CHỨNG ✅
+
+> Toàn bộ dự án đã được build & chạy thử thành công trên **Ubuntu 24.04, Rust 1.94 (stable), Python 3.11** ngày 2026-07-08. Kết quả: **17 binary Rust** + **1 Python wheel**, và bộ `verify` của dự án đạt các phase liên quan tới build.
+
+### 8.1. Lấy source (kèm submodule — BẮT BUỘC)
+Repo dùng nhiều git submodule (`vendor/*`, `ruv-neural`, `worldgraph`, `rufield`, `rvcsi`, `ruview-swarm`). Thiếu là build fail:
+```bash
+git clone --recurse-submodules https://github.com/ruvnet/RuView
+# hoặc nếu đã clone:
+cd RuView && git submodule update --init --recursive
+```
+
+### 8.2. Công cụ cần
+- **Rust** (repo pin 1.89 qua `rust-toolchain.toml`; stable ≥1.89 chạy tốt — dùng `RUSTUP_TOOLCHAIN=stable` để khỏi tải toolchain riêng)
+- **Python 3.10+** và **maturin** (`pip install maturin`)
+
+### 8.3. Thư viện hệ thống (Ubuntu/Debian)
+```bash
+sudo apt-get update && sudo apt-get install -y --no-install-recommends \
+  libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev librsvg2-dev \
+  libxdo-dev libayatana-appindicator3-dev \   # crate desktop (Tauri)
+  gfortran libopenblas-dev \                   # BLAS cho ndarray-linalg (person-counting)
+  libudev-dev make                             # serialport (giao tiếp ESP32)
+```
+
+### 8.4. Build Python wheel (deliverable chính, tự chứa)
+```bash
+cd python
+maturin build --release          # → target/wheels/wifi_densepose-2.0.0a1-*.whl
+pip install target/wheels/wifi_densepose-2.0.0a1-*.whl
+python -c "import wifi_densepose as w; print(w.hello())"   # -> ok
+```
+
+### 8.5. Build Rust workspace (17 binary)
+```bash
+cd v2 && RUSTUP_TOOLCHAIN=stable cargo build --release --workspace
+# hoặc: make build-rust
+```
+Binary xuất ra ở `v2/target/release/`: `wifi-densepose` (CLI), `sensing-server`,
+`homecore-server`, `homecore-api-server`, `nvsim-server`, `wifi-densepose-desktop`,
+`cog-pose-estimation`, `cog-person-count`, `cog-ha-matter`, `ruview-pointcloud`, `train`…
+
+> **⚠️ Hai chỉnh sửa trong `v2/Cargo.toml` — CHỈ cần khi build trong môi trường CHẶN mạng** (như sandbox này). Máy có internet bình thường thì để nguyên mặc định:
+> 1. `ndarray-linalg`: đổi feature `openblas-static` → **`openblas-system`** (dùng `libopenblas-dev` hệ thống thay vì tải + build OpenBLAS từ nguồn).
+> 2. `ort` (ONNX Runtime): đổi thành `default-features = false, features = ["load-dynamic"]` (nạp `libonnxruntime.so` lúc chạy thay vì tải binary từ `cdn.pyke.io`). Khi chạy các binary ML, trỏ `ORT_DYLIB_PATH` tới `libonnxruntime.so` (ví dụ lấy từ `pip install onnxruntime`).
+
+### 8.6. Kiểm chứng
+```bash
+./v2/target/release/wifi-densepose version      # wifi-densepose 0.3.1 (+ MAT 0.3.1)
+./v2/target/release/sensing-server --help
+pip install numpy scipy                          # cần cho Phase 1 của verify
+./verify --quick                                 # trust kill switch (proof pipeline)
+```
+Kết quả `verify` mong đợi: **Phase 1** (pipeline hash khớp), **Phase 2** (không có random giả),
+**Phase 4** (PyO3 compile sạch), **Phase 5** (invariant riêng tư) đều **PASS**. Phase 6 (kiểm
+tra crates.io) sẽ FAIL nếu build từ source chưa publish — điều này **bình thường**, không phải lỗi build.
+
+---
+
 ## Nguồn tham khảo
 - Repo: https://github.com/ruvnet/RuView
 - README: https://github.com/ruvnet/RuView/blob/main/README.md
