@@ -87,6 +87,16 @@
   .heatbar{height:9px;border-radius:5px;margin-top:8px;
     background:linear-gradient(90deg,var(--heat-0),var(--heat-1),var(--heat-2),var(--heat-3),var(--heat-4),var(--heat-5))}
   .scalerow{display:flex;justify-content:space-between;font-size:10.5px;color:var(--muted);margin-top:3px}
+  .srcbar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:14px 0 0;
+    background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:10px 12px}
+  .srcbar .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+  #liveBox{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  #wsUrl{font:inherit;font-size:12.5px;color:var(--ink);background:var(--surface-2);border:1px solid var(--border);
+    border-radius:7px;padding:6px 9px;width:210px;font-variant-numeric:tabular-nums}
+  .stat-pill{font-size:12px;color:var(--ink-2);background:var(--surface-2);border:1px solid var(--border);
+    border-radius:999px;padding:4px 10px;display:inline-flex;align-items:center;gap:6px}
+  .stat-pill.ok{color:var(--good);border-color:color-mix(in srgb,var(--good) 40%,transparent)}
+  .stat-pill.err{color:var(--crit);border-color:color-mix(in srgb,var(--crit) 40%,transparent)}
   footer{margin-top:20px;font-size:12px;color:var(--muted);border-top:1px solid var(--border);padding-top:14px}
   footer code{background:var(--surface-2);padding:1px 5px;border-radius:4px;color:var(--ink-2)}
   @media (max-width:820px){ .kpis{grid-template-columns:repeat(2,1fr)} .grid{grid-template-columns:1fr} .controls{grid-template-columns:1fr} }
@@ -107,6 +117,20 @@
     <button class="btn" id="themeBtn" title="Đổi giao diện sáng/tối">◐ Theme</button>
     <button class="btn primary" id="playBtn">⏸ Tạm dừng</button>
   </header>
+
+  <!-- Data source -->
+  <section class="srcbar">
+    <span class="lbl">Nguồn dữ liệu</span>
+    <div class="seg" id="cSrc">
+      <button data-s="sim" class="on">🧪 Mô phỏng</button>
+      <button data-s="live">📶 WiFi thật (Live CSI)</button>
+    </div>
+    <div id="liveBox" style="display:none">
+      <input id="wsUrl" value="ws://localhost:8765" spellcheck="false" aria-label="WebSocket URL của bridge CSI">
+      <button class="btn" id="wsConnect">Kết nối</button>
+      <span class="stat-pill" id="wsStat"><span class="dot" style="background:var(--muted);animation:none"></span>chưa kết nối</span>
+    </div>
+  </section>
 
   <!-- KPI row -->
   <section class="kpis">
@@ -230,8 +254,10 @@
   const NSUB=56;             // subcarriers
   const state={
     people:1, act:"breathe", brSet:15, hrSet:72, noise:0.20, dist:3.0,
-    playing:true, t:0
+    playing:true, t:0, source:"sim"
   };
+  // live-CSI state
+  let ws=null, baseline=null, liveMotion=0, lastLiveTs=0, liveFps=0;
   // ring buffers
   const resid=new Float32Array(N); let ri=0, filled=0;   // residual tổng hợp
   const brBuf=new Float32Array(N), hrBuf=new Float32Array(N);
@@ -453,14 +479,80 @@
     const c=heat.getContext('2d');c.setTransform(1,0,0,1,0,0);c.fillStyle=cssv('--heat-0');c.fillRect(0,0,heat.width,heat.height);
   });
 
+  // ---------- LIVE: nhận CSI thật qua WebSocket ----------
+  // Định dạng frame kỳ vọng (JSON, mỗi frame một dòng/message):
+  //   {"subcarriers":[a0,a1,...,a55]}   // biên độ mỗi subcarrier (>=1 giá trị)
+  //   hoặc {"csi":[...]} / mảng số thuần []  — bridge gửi ~25 Hz.
+  function pushLiveFrame(amps){
+    const n=amps.length; if(!n) return;
+    if(!baseline || baseline.length!==n){ baseline=Float32Array.from(amps); }
+    // residual per-subcarrier qua baseline EMA (giống bước tiền xử lý CSI thật)
+    let agg=0; const col=new Float32Array(n);
+    for(let k=0;k<n;k++){
+      const r=amps[k]-baseline[k];
+      baseline[k]=baseline[k]*0.995+amps[k]*0.005;   // baseline chậm
+      col[k]=Math.abs(r); agg+=r;
+    }
+    agg/=n;
+    // đẩy vào cùng ring buffer + detect() dùng lại y hệt mô phỏng
+    resid[ri]=agg; brBuf[ri]=agg; hrBuf[ri]=agg; ri=(ri+1)%N; if(filled<N)filled++;
+    liveMotion=liveMotion*0.9 + Math.min(1, (col.reduce((s,v)=>s+v,0)/n)/1.5)*0.1;
+    motionEnergy=liveMotion*2;
+    drawHeatN(col,n);
+    // đo fps
+    const now=performance.now(); if(lastLiveTs){liveFps=0.8*liveFps+0.2*(1000/(now-lastLiveTs));} lastLiveTs=now;
+  }
+  function parseFrame(data){
+    try{ const j=JSON.parse(data);
+      if(Array.isArray(j)) return j.map(Number);
+      if(Array.isArray(j.subcarriers)) return j.subcarriers.map(Number);
+      if(Array.isArray(j.csi)) return j.csi.map(Number);
+      if(Array.isArray(j.amplitude)) return j.amplitude.map(Number);
+    }catch(e){ // thử CSV
+      const p=String(data).trim().split(/[,\s]+/).map(Number).filter(v=>!isNaN(v));
+      if(p.length) return p;
+    }
+    return null;
+  }
+  function setWsStat(txt,cls){const el=$('wsStat');el.className='stat-pill'+(cls?' '+cls:'');
+    el.innerHTML='<span class="dot" style="background:currentColor;animation:none"></span>'+txt;}
+  function connectWs(){
+    const url=$('wsUrl').value.trim(); if(!url) return;
+    try{ ws=new WebSocket(url); }catch(e){ setWsStat('URL không hợp lệ','err'); return; }
+    setWsStat('đang kết nối…');
+    $('wsConnect').textContent='Ngắt';
+    ws.onopen=()=>{ setWsStat('đã kết nối','ok'); $('statusTxt').textContent='Live CSI từ WiFi thật'; baseline=null; filled=0; ri=0; };
+    ws.onmessage=ev=>{ const a=parseFrame(ev.data); if(a) pushLiveFrame(a); };
+    ws.onerror=()=>{ setWsStat('lỗi kết nối (kiểm tra bridge & mixed-content)','err'); };
+    ws.onclose=()=>{ setWsStat('đã ngắt'); $('wsConnect').textContent='Kết nối'; ws=null; };
+  }
+  function disconnectWs(){ if(ws){ try{ws.close();}catch(e){} ws=null; } }
+  function drawHeatN(col,n){ // heatmap cho n subcarrier bất kỳ (live)
+    const scaled=new Float32Array(NSUB);
+    for(let k=0;k<NSUB;k++){ const src=Math.floor(k*n/NSUB); scaled[k]=col[src]/1.35; }
+    // tái dùng drawHeat: nó tự chuẩn hoá 0.06+col/1.35, nên đưa raw
+    const raw=new Float32Array(NSUB);
+    for(let k=0;k<NSUB;k++){ const src=Math.floor(k*n/NSUB); raw[k]=col[src]; }
+    drawHeat(raw);
+  }
+  $('cSrc').addEventListener('click',e=>{ const s=e.target.dataset.s; if(!s) return;
+    state.source=s; [...$('cSrc').children].forEach(b=>b.classList.toggle('on',b.dataset.s===s));
+    $('liveBox').style.display = s==='live'?'flex':'none';
+    if(s==='sim'){ disconnectWs(); $('statusTxt').textContent='Đang thu CSI…'; filled=0;ri=0; step(WIN);
+      for(let i=0;i<Math.ceil((heat.clientWidth||700)/2)+40;i++) drawHeat(step(0.04)); }
+    else { $('statusTxt').textContent='Chờ kết nối bridge CSI…'; filled=0;ri=0;baseline=null;
+      const c=heat.getContext('2d');c.setTransform(1,0,0,1,0,0);c.fillStyle=cssv('--heat-0');c.fillRect(0,0,heat.width,heat.height); }
+  });
+  $('wsConnect').addEventListener('click',()=>{ ws?disconnectWs():connectWs(); });
+
   // ---------- main loop ----------
   let last=performance.now(), acc=0, detAcc=0, lastBr={bpm:null,conf:0,spec:[]}, lastHr={bpm:null,conf:0,spec:[]};
   function frame(now){
     const dt=Math.min(0.1,(now-last)/1000); last=now;
-    if(state.playing){
-      const col=step(dt);
-      drawHeat(col);
-      drawPose();
+    const live=state.source==='live';
+    if(state.source==='sim' && state.playing){ drawHeat(step(dt)); }
+    drawPose();
+    if((state.playing||live)){
       drawWave(brW,brBuf,cssv('--br'));
       drawWave(hrW,hrBuf,cssv('--hr'));
       detAcc+=dt;
@@ -468,26 +560,29 @@
         lastBr=detect(brBuf,0.1,0.5,40);
         lastHr=detect(hrBuf,0.8,2.0,50);
         drawSpec(lastBr,lastHr);
-        updateKPIs(lastBr,lastHr);
+        updateKPIs(lastBr,lastHr,live);
       }
-    } else { drawPose(); }
+    }
     requestAnimationFrame(frame);
   }
 
-  function updateKPIs(br,hr){
+  function updateKPIs(br,hr,live){
     const motPct=Math.round(Math.min(1,motionEnergy/2)*100);
     $('kMotion').innerHTML=motPct+'<small>%</small>';
-    const present= state.people>0;
+    // trong live: hiện diện suy từ năng lượng chuyển động / tín hiệu vitals
+    const present= live ? (motPct>6 || (br&&br.conf>0.15)) : state.people>0;
+    if(live){ $('kPeople').textContent = present?'≥1':'0'; $('kActM').textContent='trạng thái: '+(motPct>25?'chuyển động':'tĩnh'); }
     $('kPresence').textContent=present?'CÓ':'KHÔNG';
     $('kPresence').style.color=present?'var(--good)':'var(--muted)';
     $('kPresenceM').textContent=present?(motPct>30?'chuyển động rõ':'có vi chuyển động'):'phòng trống';
+    const alive = live ? present : state.people>0;
     // breathing
-    if(state.people>0 && br.bpm && br.conf>0.12){
+    if(alive && br.bpm && br.conf>0.12){
       const v=Math.round(br.bpm);
       $('kBr').innerHTML=v+' <small>BPM</small>'; $('brInline').textContent=v;
       $('kBrM').textContent='độ tin cậy '+(br.conf*100|0)+'%';
     } else { $('kBr').innerHTML='— <small>BPM</small>';$('brInline').textContent='—';$('kBrM').textContent='tín hiệu yếu'; }
-    if(state.people>0 && hr.bpm && hr.conf>0.10 && state.act!=='walk'){
+    if(alive && hr.bpm && hr.conf>0.10 && (live||state.act!=='walk')){
       const v=Math.round(hr.bpm);
       $('kHr').innerHTML=v+' <small>BPM</small>'; $('hrInline').textContent=v;
       $('kHrM').textContent='độ tin cậy '+(hr.conf*100|0)+'%';
