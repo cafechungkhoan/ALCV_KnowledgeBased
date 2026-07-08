@@ -1,0 +1,11 @@
+# Cấu hình deploy dashboard RuView lên Netlify.
+# Khi nối repo này vào Netlify (Add new site → Import from Git), Netlify sẽ
+# publish thẳng thư mục dashboard, không cần build.
+[build]
+  publish = "ruview-demo"
+  command = ""
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
